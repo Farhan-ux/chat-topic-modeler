@@ -17,10 +17,12 @@ import {
   Lock,
   Sparkles,
   AlertCircle,
+  RotateCcw,
 } from "lucide-react";
 import { useAnalyzerStore } from "@/lib/store";
 import { LLMClient, PROVIDER_INFO, PROVIDER_MODELS, type Provider } from "@/lib/llm-client";
 import { parseWhatsAppChat, getChatStats } from "@/lib/whatsapp-parser";
+import { getResumableChunkCount, clearAnalysisCache } from "@/lib/analyzer";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -124,10 +126,27 @@ export function LandingScreen() {
     consentGiven === true &&
     !parsing;
 
+  const [resumableChunks, setResumableChunks] = React.useState(0);
+
+  React.useEffect(() => {
+    if (parseResult) {
+      setResumableChunks(getResumableChunkCount(parseResult));
+    } else {
+      setResumableChunks(0);
+    }
+  }, [parseResult]);
+
   const handleAnalyze = () => {
     if (!canAnalyze) return;
     setErrorMessage(null);
     setScreen("analyzing");
+  };
+
+  const handleDiscardCache = () => {
+    if (parseResult) {
+      clearAnalysisCache(parseResult);
+      setResumableChunks(0);
+    }
   };
 
   const stats = parseResult ? getChatStats(parseResult) : null;
@@ -354,6 +373,26 @@ export function LandingScreen() {
                   );
                 })}
               </div>
+            )}
+
+            {resumableChunks > 0 && parseResult && (
+              <Alert className="border-green-500/30 bg-green-500/5">
+                <RotateCcw className="h-4 w-4 text-green-500" />
+                <AlertTitle className="text-xs text-green-700 dark:text-green-400">
+                  Resumable analysis detected — {resumableChunks.toLocaleString()} chunks cached
+                </AlertTitle>
+                <AlertDescription className="text-xs">
+                  A previous run of this chat was interrupted. With your API key, the analysis will
+                  skip Phase 1 (topic extraction) and resume directly at Phase 2/3 — saving ~40 minutes
+                  and hundreds of API requests.
+                  <button
+                    onClick={handleDiscardCache}
+                    className="ml-1 text-muted-foreground underline hover:text-foreground"
+                  >
+                    Discard cache
+                  </button>
+                </AlertDescription>
+              </Alert>
             )}
           </CardContent>
         </Card>

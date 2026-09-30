@@ -16,6 +16,93 @@ import { LLMClient, LLMError, extractJSON, type ChatMessage } from "./llm-client
 import { buildChunkPrompt, buildBatchedChunkPrompt, buildMonthlyAggregationPrompt, buildFinalReportPrompt } from "./prompts";
 import type { TopicReport } from "./report-types";
 
+// ───────────────────────────────────────────────────────────────────────────
+// Phase 1 result caching (localStorage)
+// ───────────────────────────────────────────────────────────────────────────
+// If Phase 3 fails (e.g. 503), the user shouldn't have to re-run Phase 1
+// (which can take 40+ minutes and burn 400+ API requests). We cache each
+// completed chunk summary to localStorage as it arrives, and on the next
+// run with the same chat, we skip already-completed chunks.
+
+const CACHE_PREFIX = "topic-modeler:phase1:";
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+interface CachedPhase1 {
+  chunkSummaries: (ChunkSummary | null)[];
+  cachedAt: number;
+  totalChunks: number;
+}
+
+function getCacheKey(parseResult: ParseResult): string {
+  const participants = parseResult.participants.slice().sort().join("|");
+  const msgCount = parseResult.messages.length;
+  const dateRange = parseResult.dateRange
+    ? `${parseResult.dateRange.start.getTime()}-${parseResult.dateRange.end.getTime()}`
+    : "no-dates";
+  return `${CACHE_PREFIX}${participants}:${msgCount}:${dateRange}`;
+}
+
+function loadCachedPhase1(parseResult: ParseResult): CachedPhase1 | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const key = getCacheKey(parseResult);
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const data = JSON.parse(raw) as CachedPhase1;
+    // Expire old caches
+    if (Date.now() - data.cachedAt > CACHE_TTL_MS) {
+      localStorage.removeItem(key);
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function saveCachedPhase1(parseResult: ParseResult, summaries: (ChunkSummary | null)[]) {
+  if (typeof window === "undefined") return;
+  try {
+    const key = getCacheKey(parseResult);
+    const data: CachedPhase1 = {
+      chunkSummaries: summaries,
+      cachedAt: Date.now(),
+      totalChunks: summaries.length,
+    };
+    localStorage.setItem(key, JSON.stringify(data));
+  } catch (err) {
+    // localStorage might be full (large chat) — fail silently
+    console.warn("Failed to cache Phase 1 results:", err);
+  }
+}
+
+function clearCachedPhase1(parseResult: ParseResult) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.removeItem(getCacheKey(parseResult));
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Check if there's a resumable Phase 1 cache for the given chat.
+ * Returns the number of completed chunks, or 0 if no cache.
+ */
+export function getResumableChunkCount(parseResult: ParseResult): number {
+  const cached = loadCachedPhase1(parseResult);
+  if (!cached) return 0;
+  return cached.chunkSummaries.filter((s) => s !== null).length;
+}
+
+/**
+ * Clear the Phase 1 cache for a given chat (called on successful completion
+ * or when the user starts a new analysis).
+ */
+export function clearAnalysisCache(parseResult: ParseResult) {
+  clearCachedPhase1(parseResult);
+}
+
 export interface TopicEntry {
   name: string;
   share: number;
@@ -82,7 +169,7 @@ export async function runAnalysis(opts: AnalyzerOptions): Promise<AnalysisResult
   const personB = parseResult.participants[1];
 
   // ─────────────────────────────────────────────────────────────
-  // PHASE 1: Chunk processing (batched)
+  // PHASE 1: Chunk processing (batched, with resume from cache)
   // ─────────────────────────────────────────────────────────────
   const chunks = chunkChat(parseResult);
   if (chunks.length === 0) {
@@ -90,48 +177,95 @@ export async function runAnalysis(opts: AnalyzerOptions): Promise<AnalysisResult
   }
 
   const batches = batchChunks(chunks);
-  const chunkSummaries: ChunkSummary[] = new Array(chunks.length);
+  // Use (ChunkSummary | null)[] so we can track which chunks are cached vs pending
+  const chunkSummaries: (ChunkSummary | null)[] = new Array(chunks.length).fill(null);
   const stepDurations: number[] = [];
   let processedChunks = 0;
+
+  // Try to load cached Phase 1 results (from a previous run that may have
+  // failed at Phase 2 or 3). This saves 40+ minutes and 400+ API requests
+  // when retrying after a transient error like a 503.
+  const cached = loadCachedPhase1(parseResult);
+  if (cached && cached.chunkSummaries.length === chunks.length) {
+    let restoredCount = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      if (cached.chunkSummaries[i]) {
+        chunkSummaries[i] = cached.chunkSummaries[i];
+        restoredCount++;
+      }
+    }
+    if (restoredCount > 0) {
+      processedChunks = restoredCount;
+      console.log(`Resumed Phase 1 from cache: ${restoredCount}/${chunks.length} chunks already completed.`);
+      onProgress({
+        phase: 1,
+        phaseName: "Resuming from cache",
+        current: restoredCount,
+        total: chunks.length,
+        message: `Resumed ${restoredCount.toLocaleString()} of ${chunks.length.toLocaleString()} chunks from cache. Skipping to remaining batches...`,
+      });
+    }
+  }
 
   for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
     if (isCancelled()) throw new AnalysisCancelledError();
 
     const batch = batches[batchIdx];
+
+    // Skip this batch if ALL its chunks are already cached
+    const allCached = batch.every((chunk) => chunkSummaries[chunk.index] !== null);
+    if (allCached) {
+      continue;
+    }
+
     const stepStart = Date.now();
+
+    // Filter out cached chunks within this batch (process only the missing ones)
+    const missingChunks = batch.filter((chunk) => chunkSummaries[chunk.index] === null);
+    const completedInBatch = batch.length - missingChunks.length;
 
     onProgress({
       phase: 1,
       phaseName: "Extracting topics from chat chunks",
       current: processedChunks + 1,
       total: chunks.length,
-      message: `Analyzing batch ${batchIdx + 1} of ${batches.length} (${batch.length} weeks: ${batch[0].startDate.toLocaleDateString()} → ${batch[batch.length - 1].endDate.toLocaleDateString()})`,
+      message: `Analyzing batch ${batchIdx + 1} of ${batches.length} (${missingChunks.length} weeks: ${missingChunks[0].startDate.toLocaleDateString()} → ${missingChunks[missingChunks.length - 1].endDate.toLocaleDateString()})${completedInBatch > 0 ? ` · ${completedInBatch} cached` : ''}`,
       etaSeconds: estimateEta(stepDurations, batches.length - batchIdx),
     });
 
-    const summariesForBatch = await processBatch(batch, personA, personB, client, opts, isCancelled);
-    for (let i = 0; i < batch.length; i++) {
-      const chunk = batch[i];
+    // If some chunks in this batch are cached, process only the missing ones
+    const summariesForBatch = missingChunks.length === batch.length
+      ? await processBatch(batch, personA, personB, client, opts, isCancelled)
+      : await processBatch(missingChunks, personA, personB, client, opts, isCancelled);
+
+    for (let i = 0; i < missingChunks.length; i++) {
+      const chunk = missingChunks[i];
       const originalIdx = chunk.index;
       chunkSummaries[originalIdx] = summariesForBatch[i];
     }
-    processedChunks += batch.length;
+    processedChunks += missingChunks.length;
     stepDurations.push(Date.now() - stepStart);
+
+    // Save to cache after each batch (so progress is preserved even if
+    // the user closes the tab or the connection drops)
+    saveCachedPhase1(parseResult, chunkSummaries);
   }
 
-  // Fill any gaps with fallback summaries
+  // Fill any gaps with fallback summaries (shouldn't happen, but just in case)
   for (let i = 0; i < chunkSummaries.length; i++) {
     if (!chunkSummaries[i]) {
       chunkSummaries[i] = fallbackChunkSummary(chunks[i]);
     }
   }
+  // Now safe to cast to ChunkSummary[] (no nulls remain)
+  const finalChunkSummaries: ChunkSummary[] = chunkSummaries as ChunkSummary[];
 
   // ─────────────────────────────────────────────────────────────
   // PHASE 2: Aggregation (monthly if needed)
   // ─────────────────────────────────────────────────────────────
   if (isCancelled()) throw new AnalysisCancelledError();
 
-  const summaryStrings = chunkSummaries.map((s) => JSON.stringify(s));
+  const summaryStrings = finalChunkSummaries.map((s) => JSON.stringify(s));
   const { aggregated, needsMonthlyAggregation: autoNeedsAgg } = aggregateSummaries(summaryStrings);
 
   const forceAggregation = chunks.length >= 6;
@@ -168,7 +302,7 @@ export async function runAnalysis(opts: AnalyzerOptions): Promise<AnalysisResult
       });
 
       const chunkIndexes = new Set(group.map((c) => c.index));
-      const weeklySummariesForMonth = chunkSummaries
+      const weeklySummariesForMonth = finalChunkSummaries
         .filter((_, idx) => chunkIndexes.has(idx))
         .map((s) => JSON.stringify(s));
 
@@ -217,7 +351,9 @@ export async function runAnalysis(opts: AnalyzerOptions): Promise<AnalysisResult
   let report: TopicReport | null = null;
   let lastError: Error | null = null;
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  // 5 attempts (up from 3) to handle transient 503/UNAVAILABLE errors that
+  // may persist beyond the LLMClient's internal 6-retry backoff.
+  for (let attempt = 0; attempt < 5; attempt++) {
     if (isCancelled()) throw new AnalysisCancelledError();
     try {
       const finalPrompt = buildFinalReportPrompt(
@@ -283,6 +419,13 @@ export async function runAnalysis(opts: AnalyzerOptions): Promise<AnalysisResult
           opts.onCooldown?.(wait, "Rate limit on capable model. Cooling down...");
           continue;
         }
+        if (err.type === "service_unavailable") {
+          // 503/UNAVAILABLE — transient. Wait and retry.
+          const wait = 30;
+          opts.onCooldown?.(wait, `Service temporarily unavailable (503). Waiting ${wait}s before retry...`);
+          await new Promise((r) => setTimeout(r, wait * 1000));
+          continue;
+        }
         if (err.type === "invalid_api_key") throw err;
         if (err.type === "model_unavailable") throw err;
         if (err.type === "context_too_long") {
@@ -295,7 +438,7 @@ export async function runAnalysis(opts: AnalyzerOptions): Promise<AnalysisResult
           throw new Error(`${err.message}\n\nAPI response: ${err.rawBody.slice(0, 500)}`);
         }
       }
-      if (attempt < 2) {
+      if (attempt < 4) {
         await new Promise((r) => setTimeout(r, 1500));
         continue;
       }
@@ -323,9 +466,12 @@ export async function runAnalysis(opts: AnalyzerOptions): Promise<AnalysisResult
     message: "Topic report complete!",
   });
 
+  // Clear the Phase 1 cache on successful completion (no need to keep it)
+  clearCachedPhase1(parseResult);
+
   return {
     report,
-    chunkSummaries,
+    chunkSummaries: finalChunkSummaries,
     chunks,
   };
 }
@@ -384,6 +530,12 @@ async function processBatch(
           opts.onCooldown?.(wait, "Rate limit reached. Cooling down...");
           continue;
         }
+        if (err.type === "service_unavailable") {
+          const wait = 20;
+          opts.onCooldown?.(wait, "Service temporarily unavailable (503). Waiting...");
+          await new Promise((r) => setTimeout(r, wait * 1000));
+          continue;
+        }
         if (err.type === "invalid_api_key") throw err;
         if (err.type === "model_unavailable") throw err;
         if (err.type === "context_too_long") {
@@ -436,6 +588,12 @@ async function processSingleChunk(
         if (err.type === "rate_limited") {
           const wait = Math.min((err.retryAfter ?? 5000) / 1000, 60);
           opts.onCooldown?.(wait, "Rate limit reached. Cooling down...");
+          continue;
+        }
+        if (err.type === "service_unavailable") {
+          const wait = 20;
+          opts.onCooldown?.(wait, "Service temporarily unavailable (503). Waiting...");
+          await new Promise((r) => setTimeout(r, wait * 1000));
           continue;
         }
         if (err.type === "invalid_api_key") throw err;

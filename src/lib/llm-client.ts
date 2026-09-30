@@ -105,6 +105,7 @@ export class LLMError extends Error {
     | "network"
     | "incomplete"
     | "model_unavailable"
+    | "service_unavailable"
     | "unknown";
   retryAfter?: number; // ms
   /** Raw response body from the API, for debugging */
@@ -150,7 +151,7 @@ function isContextLengthError(body: string): boolean {
 }
 
 /**
- * Heuristic: does this error indicate the model is unavailable for this account?
+ * Heuristic: does this API error body indicate the model is unavailable for this account?
  */
 function isModelUnavailableError(body: string): boolean {
   const lower = body.toLowerCase();
@@ -158,6 +159,26 @@ function isModelUnavailableError(body: string): boolean {
     (lower.includes("model") && (lower.includes("not found") || lower.includes("not available") || lower.includes("does not exist"))) ||
     lower.includes("model_decommissioned") ||
     lower.includes("model_not_found")
+  );
+}
+
+/**
+ * Heuristic: does this error indicate a transient service outage (503)?
+ * Google returns: "This model is currently experiencing high demand" / status "UNAVAILABLE"
+ * Groq/OpenAI return 503 with various messages.
+ */
+function isServiceUnavailableError(status: number, body: string): boolean {
+  if (status === 503) return true;
+  // Also catch 500/502/504 which are similarly transient
+  if (status === 500 || status === 502 || status === 504) return true;
+  const lower = body.toLowerCase();
+  return (
+    lower.includes("unavailable") ||
+    lower.includes("high demand") ||
+    lower.includes("currently experiencing") ||
+    lower.includes("try again later") ||
+    lower.includes("temporarily unavailable") ||
+    lower.includes("service disruption")
   );
 }
 
@@ -361,7 +382,18 @@ export class LLMClient {
       return response;
     } catch (err) {
       if (err instanceof LLMError) {
-        // Retry on network errors and rate limits (with backoff)
+        // Retry on service_unavailable (503) with aggressive backoff —
+        // these are transient ("high demand" / "currently experiencing load")
+        // and almost always succeed on retry. Up to 6 attempts.
+        if (err.type === "service_unavailable" && attempt < 6) {
+          // Backoff: 5s, 10s, 20s, 30s, 40s, 60s
+          const backoff = Math.min(5_000 * Math.pow(2, attempt), 60_000);
+          console.warn(`Service unavailable (503). Retrying in ${backoff / 1000}s (attempt ${attempt + 1}/6)...`);
+          await new Promise((r) => setTimeout(r, backoff));
+          return this.sendRequest(model, messages, options, attempt + 1);
+        }
+
+        // Retry on network errors and incomplete responses (3 attempts)
         const shouldRetry =
           (err.type === "network" || err.type === "incomplete") &&
           attempt < 3;
@@ -494,6 +526,15 @@ export class LLMClient {
     }
     if (!response.ok) {
       const text = await response.text();
+      if (isServiceUnavailableError(response.status, text)) {
+        throw new LLMError(
+          "service_unavailable",
+          `Groq service temporarily unavailable (${response.status}). Will retry.`,
+          undefined,
+          text,
+          response.status
+        );
+      }
       throw new LLMError(
         "unknown",
         `Groq API error ${response.status}: ${text.slice(0, 300)}`,
@@ -587,6 +628,15 @@ export class LLMClient {
     }
     if (!response.ok) {
       const text = await response.text();
+      if (isServiceUnavailableError(response.status, text)) {
+        throw new LLMError(
+          "service_unavailable",
+          `OpenAI service temporarily unavailable (${response.status}). Will retry.`,
+          undefined,
+          text,
+          response.status
+        );
+      }
       throw new LLMError(
         "unknown",
         `OpenAI API error ${response.status}: ${text.slice(0, 300)}`,
@@ -701,6 +751,15 @@ export class LLMClient {
     }
     if (!response.ok) {
       const text = await response.text();
+      if (isServiceUnavailableError(response.status, text)) {
+        throw new LLMError(
+          "service_unavailable",
+          `Google AI service temporarily unavailable (${response.status}). Will retry.`,
+          undefined,
+          text,
+          response.status
+        );
+      }
       throw new LLMError(
         "unknown",
         `Google API error ${response.status}: ${text.slice(0, 300)}`,
