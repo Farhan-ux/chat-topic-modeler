@@ -9,7 +9,12 @@
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind_4-38BDF8?style=for-the-badge&logo=tailwind-css&logoColor=white)](https://tailwindcss.com/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
-**What do you actually talk about?**
+**🚀 [Live Demo](https://chatmodeler.space-z.ai/)** · 
+**📚 [Documentation](#-what-is-this)** · 
+**🐛 [Report Bug](https://github.com/Farhan-ux/chat-topic-modeler/issues)** · 
+**✨ [Request Feature](https://github.com/Farhan-ux/chat-topic-modeler/issues)**
+
+---
 
 *Privacy-first · No data stored · Works with Groq, Google AI Studio & OpenAI*
 
@@ -78,7 +83,13 @@ It's the topic-focused sibling of [chat-dynamics-analyzer](https://github.com/Fa
 
 ## 🚀 Quick Start
 
-### Run Locally
+### Option A: Use the Live Demo
+1. Visit the **[Live Demo](https://chatmodeler.space-z.ai/)**
+2. Get a free API key from one of the providers below
+3. Export your WhatsApp chat (Without Media) → `.txt` file
+4. Upload, validate, analyze!
+
+### Option B: Run Locally
 
 ```bash
 # Clone the repo
@@ -231,7 +242,7 @@ The app is designed to handle chats from 100 messages to 150,000+ messages:
 
 This project is the topic-focused sibling of:
 
-- **[chat-dynamics-analyzer](https://github.com/Farhan-ux/chat-dynamics-analyzer)** — Analyzes WHO you are to each other (personality, relationship dynamics, MBTI, humor, love & romance). 13-section psychological report.
+- **[chat-dynamics-analyzer](https://github.com/Farhan-ux/chat-dynamics-analyzer)** · [Live Demo](https://friendsgpt.space-z.ai/) — Analyzes WHO you are to each other (personality, relationship dynamics, MBTI, humor, love & romance). 13-section psychological report.
 
 Use them together for the full picture: chat-dynamics-analyzer tells you who you are, chat-topic-modeler tells you what you talk about.
 
@@ -248,5 +259,10 @@ MIT License — see the [LICENSE](LICENSE) file for details.
 **Built with 💜 by [Farhan Ch](https://github.com/Farhan-ux)**
 
 **⭐ Star this repo if it helped you!**
+
+[🚀 Try the Live Demo](https://chatmodeler.space-z.ai/) · 
+[📚 Read the Docs](#-what-is-this) · 
+[🐛 Report a Bug](https://github.com/Farhan-ux/chat-topic-modeler/issues) · 
+[💡 Request a Feature](https://github.com/Farhan-ux/chat-topic-modeler/issues)
 
 </div>
