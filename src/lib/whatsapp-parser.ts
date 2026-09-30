@@ -254,12 +254,20 @@ export function parseWhatsAppChat(rawText: string): ParseResult {
   }
 
   // Determine date range
+  // NOTE: We use a manual loop instead of Math.min(...timestamps) / Math.max(...timestamps)
+  // because spreading 100k+ arguments onto the call stack causes "Maximum call stack size exceeded".
   let dateRange: ParseResult["dateRange"] = null;
   if (messages.length > 0) {
-    const timestamps = messages.map((m) => m.timestamp);
+    let minTs = Infinity;
+    let maxTs = -Infinity;
+    for (let i = 0; i < messages.length; i++) {
+      const ts = messages[i].timestamp;
+      if (ts < minTs) minTs = ts;
+      if (ts > maxTs) maxTs = ts;
+    }
     dateRange = {
-      start: new Date(Math.min(...timestamps)),
-      end: new Date(Math.max(...timestamps)),
+      start: new Date(minTs),
+      end: new Date(maxTs),
     };
   }
 
